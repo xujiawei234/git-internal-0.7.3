@@ -1,0 +1,395 @@
+//! Multi-tier cache for pack decoding that combines an in-memory LRU with spill-to-disk storage and
+//! bookkeeping for concurrent rebuild tasks.
+
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, Once,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::sleep,
+};
+
+use dashmap::{DashMap, DashSet};
+use lru_mem::LruCache;
+use threadpool::ThreadPool;
+
+use crate::{
+    hash::ObjectHash,
+    internal::pack::cache_object::{ArcWrapper, CacheObject, FileLoadStore, MemSizeRecorder},
+    time_it,
+};
+
+/// Cache format version appended to the disk path so that caches written with an
+/// incompatible serialization format (for example the previous bincode layout)
+/// are ignored instead of causing deserialization errors.
+const CACHE_LAYOUT_VERSION: &str = "rkyv-v1";
+
+/// Trait defining the interface for a multi-tier cache system.
+/// This cache supports insertion and retrieval of objects by both offset and hash,
+/// as well as memory usage tracking and clearing functionality.
+pub trait _Cache {
+    fn new(mem_size: Option<usize>, tmp_path: PathBuf, thread_num: usize) -> Self
+    where
+        Self: Sized;
+    fn get_hash(&self, offset: usize) -> Option<ObjectHash>;
+    fn insert(&self, offset: usize, hash: ObjectHash, obj: CacheObject) -> Arc<CacheObject>;
+    fn get_by_offset(&self, offset: usize) -> Option<Arc<CacheObject>>;
+    fn get_by_hash(&self, h: ObjectHash) -> Option<Arc<CacheObject>>;
+    fn total_inserted(&self) -> usize;
+    fn memory_used(&self) -> usize;
+    fn clear(&self);
+}
+
+impl lru_mem::HeapSize for ObjectHash {
+    fn heap_size(&self) -> usize {
+        0
+    }
+}
+
+/// Multi-tier cache implementation combining an in-memory LRU cache with spill-to-disk storage.
+/// It uses a DashMap for offset-to-hash mapping and a DashSet to track cached hashes.
+/// The cache supports concurrent rebuild tasks using a thread pool.
+pub struct Caches {
+    map_offset: DashMap<usize, ObjectHash>, // offset to hash
+    hash_set: DashSet<ObjectHash>,          // item in the cache
+    // dropping large lru cache will take a long time on Windows without multi-thread IO
+    // because "multi-thread IO" clone Arc<CacheObject>, so it won't be dropped in the main thread,
+    // and `CacheObjects` will be killed by OS after Process ends abnormally
+    // Solution: use `mimalloc`
+    lru_cache: Mutex<LruCache<ObjectHash, ArcWrapper<CacheObject>>>,
+    mem_size: Option<usize>,
+    tmp_path: PathBuf,
+    path_prefixes: [Once; 256],
+    pool: Arc<ThreadPool>,
+    complete_signal: Arc<AtomicBool>,
+}
+
+impl Caches {
+    /// only get object from memory, not from tmp file
+    fn try_get(&self, hash: ObjectHash) -> Option<Arc<CacheObject>> {
+        let mut map = self.lru_cache.lock().unwrap();
+        map.get(&hash).map(|x| x.data.clone())
+    }
+
+    /// !IMPORTANT: because of the process of pack, the file must be written / be writing before, so it won't be dead lock
+    /// fall back to temp to get item. **invoker should ensure the hash is in the cache, or it will block forever**
+    fn get_fallback(&self, hash: ObjectHash) -> io::Result<Arc<CacheObject>> {
+        let path = self.generate_temp_path(&self.tmp_path, hash);
+        // read from tmp file
+        let obj = {
+            loop {
+                match Self::read_from_temp(&path) {
+                    Ok(x) => break x,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => return Err(e), // other error
+                }
+            }
+        };
+
+        let mut map = self.lru_cache.lock().unwrap();
+        let obj = Arc::new(obj);
+        let mut x = ArcWrapper::new(
+            obj.clone(),
+            self.complete_signal.clone(),
+            Some(self.pool.clone()),
+        );
+        x.set_store_path(path);
+        let _ = map.insert(hash, x); // handle the error
+        Ok(obj)
+    }
+
+    /// generate the temp file path, hex string of the hash
+    fn generate_temp_path(&self, tmp_path: &Path, hash: ObjectHash) -> PathBuf {
+        // Reserve capacity for base path, 2-char subdir, hex hash string, and separators
+        let mut path =
+            PathBuf::with_capacity(self.tmp_path.capacity() + hash.to_string().len() + 5);
+        path.push(tmp_path);
+        path.push(CACHE_LAYOUT_VERSION);
+        let hash_str = hash._to_string();
+        path.push(&hash_str[..2]); // use first 2 chars as the directory
+        self.path_prefixes[hash.as_ref()[0] as usize].call_once(|| {
+            // Check if the directory exists, if not, create it
+            if !path.exists() {
+                fs::create_dir_all(&path).unwrap();
+            }
+        });
+        path.push(hash_str);
+        path
+    }
+
+    /// read CacheObject from temp file
+    fn read_from_temp(path: &Path) -> io::Result<CacheObject> {
+        let obj = CacheObject::f_load(path)?;
+        // Deserializing will also create an object but without Construction outside and `::new()`
+        // So if you want to do sth. while Constructing, impl Deserialize trait yourself
+        obj.record_mem_size();
+        Ok(obj)
+    }
+
+    /// number of queued tasks in the thread pool
+    pub fn queued_tasks(&self) -> usize {
+        self.pool.queued_count()
+    }
+
+    /// memory used by the index (exclude lru_cache which is contained in CacheObject::get_mem_size())
+    pub fn memory_used_index(&self) -> usize {
+        self.map_offset.capacity()
+            * (std::mem::size_of::<usize>() + std::mem::size_of::<ObjectHash>())
+            + self.hash_set.capacity() * (std::mem::size_of::<ObjectHash>())
+    }
+
+    /// remove the tmp dir
+    pub fn remove_tmp_dir(&self) {
+        time_it!("Remove tmp dir", {
+            if self.tmp_path.exists() {
+                fs::remove_dir_all(&self.tmp_path).unwrap(); //very slow
+                // Try to remove parent .cache_temp directory if it's empty
+                if let Some(parent) = self.tmp_path.parent() {
+                    let is_cache_temp = parent
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n == ".cache_temp")
+                        .unwrap_or(false);
+                    if is_cache_temp {
+                        // Attempt to remove the parent directory if empty
+                        // This will fail silently if the directory is not empty or doesn't exist
+                        let _ = fs::remove_dir(parent);
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl _Cache for Caches {
+    /// @param size: the size of the memory lru cache. **None means no limit**
+    /// @param tmp_path: the path to store the cache object in the tmp file
+    fn new(mem_size: Option<usize>, tmp_path: PathBuf, thread_num: usize) -> Self
+    where
+        Self: Sized,
+    {
+        // `None` means no limit, so no need to create the tmp dir
+        if mem_size.is_some() {
+            fs::create_dir_all(&tmp_path).unwrap();
+        }
+
+        Caches {
+            map_offset: DashMap::new(),
+            hash_set: DashSet::new(),
+            lru_cache: Mutex::new(LruCache::new(mem_size.unwrap_or(usize::MAX))),
+            mem_size,
+            tmp_path,
+            path_prefixes: [const { Once::new() }; 256],
+            pool: Arc::new(ThreadPool::new(thread_num)),
+            complete_signal: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn get_hash(&self, offset: usize) -> Option<ObjectHash> {
+        self.map_offset.get(&offset).map(|x| *x)
+    }
+
+    fn insert(&self, offset: usize, hash: ObjectHash, obj: CacheObject) -> Arc<CacheObject> {
+        let obj_arc = Arc::new(obj);
+        {
+            // ? whether insert to cache directly or only write to tmp file
+            let mut map = self.lru_cache.lock().unwrap();
+            let mut a_obj = ArcWrapper::new(
+                obj_arc.clone(),
+                self.complete_signal.clone(),
+                Some(self.pool.clone()),
+            );
+            if self.mem_size.is_some() {
+                a_obj.set_store_path(self.generate_temp_path(&self.tmp_path, hash));
+            }
+            let _ = map.insert(hash, a_obj);
+        }
+        //order maters as for reading in 'get_by_offset()'
+        self.hash_set.insert(hash);
+        self.map_offset.insert(offset, hash);
+
+        obj_arc
+    }
+
+    /// get object by offset, from memory or tmp file
+    fn get_by_offset(&self, offset: usize) -> Option<Arc<CacheObject>> {
+        match self.map_offset.get(&offset) {
+            Some(x) => self.get_by_hash(*x),
+            None => None,
+        }
+    }
+
+    /// get object by hash, from memory or tmp file
+    fn get_by_hash(&self, hash: ObjectHash) -> Option<Arc<CacheObject>> {
+        // check if the hash is in the cache( lru or tmp file)
+        if self.hash_set.contains(&hash) {
+            match self.try_get(hash) {
+                Some(x) => Some(x),
+                None => {
+                    if self.mem_size.is_none() {
+                        panic!("should not be here when mem_size is not set")
+                    }
+                    self.get_fallback(hash).ok()
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    fn total_inserted(&self) -> usize {
+        self.hash_set.len()
+    }
+    fn memory_used(&self) -> usize {
+        self.lru_cache.lock().unwrap().current_size() + self.memory_used_index()
+    }
+    fn clear(&self) {
+        time_it!("Caches clear", {
+            self.complete_signal.store(true, Ordering::Release);
+            self.pool.join();
+            self.lru_cache.lock().unwrap().clear();
+            self.hash_set.clear();
+            self.hash_set.shrink_to_fit();
+            self.map_offset.clear();
+            self.map_offset.shrink_to_fit();
+        });
+
+        assert_eq!(self.pool.queued_count(), 0);
+        assert_eq!(self.pool.active_count(), 0);
+        assert_eq!(self.lru_cache.lock().unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{env, sync::Arc, thread};
+
+    use super::*;
+    use crate::{
+        hash::{HashKind, ObjectHash, set_hash_kind_for_test},
+        internal::{object::types::ObjectType, pack::cache_object::CacheObjectInfo},
+    };
+
+    /// Helper to build a base CacheObject with given size and hash.
+    fn make_obj(size: usize, hash: ObjectHash) -> CacheObject {
+        CacheObject {
+            info: CacheObjectInfo::BaseObject(ObjectType::Blob, hash),
+            data_decompressed: vec![0; size],
+            mem_recorder: None,
+            offset: 0,
+            crc32: 0,
+            is_delta_in_pack: false,
+        }
+    }
+
+    /// test single-threaded cache behavior with different hash kinds and capacities
+    #[test]
+    fn test_cache_single_thread() {
+        for (kind, cap, size_ab, size_c, tmp_dir) in [
+            (
+                HashKind::Sha1,
+                2048usize,
+                800usize,
+                1700usize,
+                "tests/.cache_tmp",
+            ),
+            (
+                HashKind::Sha256,
+                4096usize,
+                1500usize,
+                3000usize,
+                "tests/.cache_tmp_sha256",
+            ),
+        ] {
+            let _guard = set_hash_kind_for_test(kind);
+            let source = PathBuf::from(env::current_dir().unwrap().parent().unwrap());
+            let tmp_path = source.clone().join(tmp_dir);
+            if tmp_path.exists() {
+                fs::remove_dir_all(&tmp_path).unwrap();
+            }
+
+            let cache = Caches::new(Some(cap), tmp_path, 1);
+            let a_hash = ObjectHash::new(String::from("a").as_bytes());
+            let b_hash = ObjectHash::new(String::from("b").as_bytes());
+            let c_hash = ObjectHash::new(String::from("c").as_bytes());
+
+            let a = make_obj(size_ab, a_hash);
+            let b = make_obj(size_ab, b_hash);
+            let c = make_obj(size_c, c_hash);
+
+            // insert a
+            cache.insert(a.offset, a_hash, a.clone());
+            assert!(cache.hash_set.contains(&a_hash));
+            assert!(cache.try_get(a_hash).is_some());
+
+            // insert b, a should still be in cache
+            cache.insert(b.offset, b_hash, b.clone());
+            assert!(cache.hash_set.contains(&b_hash));
+            assert!(cache.try_get(b_hash).is_some());
+            assert!(cache.try_get(a_hash).is_some());
+
+            // insert c which will evict both a and b
+            cache.insert(c.offset, c_hash, c.clone());
+            assert!(cache.try_get(a_hash).is_none());
+            assert!(cache.try_get(b_hash).is_none());
+            assert!(cache.try_get(c_hash).is_some());
+            assert!(cache.get_by_hash(c_hash).is_some());
+        }
+    }
+
+    /// consider the multi-threaded scenario where different threads use different hash kinds
+    #[test]
+    fn test_cache_multi_thread_mixed_hash_kinds() {
+        let base = PathBuf::from(env::current_dir().unwrap().parent().unwrap());
+        let tmp_path = base.join("tests/.cache_tmp_mixed");
+        if tmp_path.exists() {
+            fs::remove_dir_all(&tmp_path).unwrap();
+        }
+
+        let cache = Arc::new(Caches::new(Some(4096), tmp_path, 2));
+
+        let cache_sha1 = Arc::clone(&cache);
+        let handle_sha1 = thread::spawn(move || {
+            let _g = set_hash_kind_for_test(HashKind::Sha1);
+            let hash = ObjectHash::new(b"sha1-entry");
+            let obj = CacheObject {
+                info: CacheObjectInfo::BaseObject(ObjectType::Blob, hash),
+                data_decompressed: vec![0; 800],
+                mem_recorder: None,
+                offset: 1,
+                crc32: 0,
+                is_delta_in_pack: false,
+            };
+            cache_sha1.insert(obj.offset, hash, obj.clone());
+            assert!(cache_sha1.hash_set.contains(&hash));
+            assert!(cache_sha1.try_get(hash).is_some());
+        });
+
+        let cache_sha256 = Arc::clone(&cache);
+        let handle_sha256 = thread::spawn(move || {
+            let _g = set_hash_kind_for_test(HashKind::Sha256);
+            let hash = ObjectHash::new(b"sha256-entry");
+            let obj = CacheObject {
+                info: CacheObjectInfo::BaseObject(ObjectType::Blob, hash),
+                data_decompressed: vec![0; 1500],
+                mem_recorder: None,
+                offset: 2,
+                crc32: 0,
+                is_delta_in_pack: false,
+            };
+            cache_sha256.insert(obj.offset, hash, obj.clone());
+            assert!(cache_sha256.hash_set.contains(&hash));
+            assert!(cache_sha256.try_get(hash).is_some());
+        });
+
+        handle_sha1.join().unwrap();
+        handle_sha256.join().unwrap();
+
+        assert_eq!(cache.total_inserted(), 2);
+    }
+}
